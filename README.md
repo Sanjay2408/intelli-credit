@@ -11,6 +11,9 @@ Upload a company's financial documents → the AI pipeline classifies, chunks an
 | | Original | This version |
 |---|---|---|
 | File formats | PDF only (Excel partially) | **PDF, XLSX, XLS, CSV, TSV, DOCX, TXT, MD, JSON, PNG/JPG/WEBP (vision OCR)** |
+| File size | Limited by server | **No practical cap** — large files are text-extracted in the browser (pdf.js / SheetJS) |
+| KYC | None | **PAN & GSTIN auto-detection**, structural validation, and external web verification (MCA, defaulter lists, enforcement actions) |
+| CAM format | Free-form prose | **Standard bank CAM template** — 14 numbered sections with field tables, verification checklist, ratio analysis, risks & mitigants, committee decision |
 | Retrieval | FAISS + PyTorch embeddings (~2 GB, can't deploy serverless) | **Stateless BM25** — pure Python, deploys anywhere, survives cold starts |
 | Web research | Serper API (extra paid key) | **Groq compound model with built-in web search** — one key for everything |
 | Hosting | Not hosted | **Single Vercel deployment** (React + FastAPI serverless) |

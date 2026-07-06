@@ -1,14 +1,17 @@
 import React, { useRef, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { useStore } from '../lib/store.jsx'
-import { processDocument, extractForm, runAssessment } from '../lib/api.js'
-import { PageHeader, ErrorBanner } from '../components/ui.jsx'
+import { processDocument, processText, extractForm, runAssessment, verifyIdentity } from '../lib/api.js'
+import { canExtractInBrowser, extractTextInBrowser } from '../lib/extract.js'
+import { PageHeader, ErrorBanner, SeverityBadge } from '../components/ui.jsx'
 import {
   UploadCloud, FileText, FileSpreadsheet, FileImage, FileJson,
   File as FileIcon, X, Wand2, Loader2, CheckCircle2, ArrowRight,
+  ShieldCheck, ShieldAlert, ShieldQuestion, Fingerprint,
 } from 'lucide-react'
 
 const ACCEPT = '.pdf,.csv,.tsv,.txt,.md,.json,.xlsx,.xlsm,.xls,.docx,.png,.jpg,.jpeg,.webp'
+const SERVER_LIMIT = 3.8 * 1024 * 1024 // beyond this, extract in the browser
 
 const iconFor = (name) => {
   const ext = name.split('.').pop().toLowerCase()
@@ -19,13 +22,36 @@ const iconFor = (name) => {
   return FileIcon
 }
 
+const VERDICT = {
+  clear: { Icon: ShieldCheck, cls: 'text-emerald-600 bg-emerald-50 border-emerald-200', label: 'Verification clear' },
+  caution: { Icon: ShieldAlert, cls: 'text-amber-600 bg-amber-50 border-amber-200', label: 'Caution advised' },
+  red_flag: { Icon: ShieldAlert, cls: 'text-red-600 bg-red-50 border-red-200', label: 'Red flags found' },
+  inconclusive: { Icon: ShieldQuestion, cls: 'text-ink-soft bg-black/[0.04] border-black/10', label: 'Inconclusive' },
+}
+
+function Step({ n, label, active, done }) {
+  return (
+    <div className={`flex items-center gap-2 ${active ? 'text-ink' : 'text-ink-faint'}`}>
+      <span className={`w-6 h-6 rounded-full text-xs font-semibold flex items-center justify-center ${
+        done ? 'bg-emerald-500 text-white' : active ? 'bg-accent text-white' : 'bg-black/[0.07]'
+      }`}>{done ? '✓' : n}</span>
+      <span className="text-sm font-medium hidden sm:inline">{label}</span>
+    </div>
+  )
+}
+
 export default function NewAssessment() {
-  const { chunks, setChunks, documents, setDocuments, company, setCompany, setAssessment, addAssessmentToHistory } = useStore()
+  const {
+    chunks, setChunks, documents, setDocuments, company, setCompany,
+    setAssessment, addAssessmentToHistory, ids, setIds, verification, setVerification,
+  } = useStore()
   const navigate = useNavigate()
   const fileRef = useRef()
   const [dragging, setDragging] = useState(false)
   const [uploading, setUploading] = useState(false)
+  const [uploadStatus, setUploadStatus] = useState('')
   const [extracting, setExtracting] = useState(false)
+  const [verifying, setVerifying] = useState(false)
   const [assessing, setAssessing] = useState(false)
   const [error, setError] = useState('')
   const [form, setForm] = useState({
@@ -35,23 +61,62 @@ export default function NewAssessment() {
 
   const set = (k) => (e) => setForm((f) => ({ ...f, [k]: e.target.value }))
 
+  const runVerification = async (name, pan, gstin) => {
+    setVerifying(true)
+    try {
+      const v = await verifyIdentity(name || form.name, pan || '', gstin || '')
+      setVerification(v)
+    } catch (e) {
+      setError(`Verification: ${e.message}`)
+    }
+    setVerifying(false)
+  }
+
   const handleFiles = async (fileList) => {
     setError('')
     setUploading(true)
+    let newPan = '', newGstin = '', newName = ''
     for (const file of Array.from(fileList)) {
       try {
-        const res = await processDocument(file)
+        let res
+        if (file.size > SERVER_LIMIT && canExtractInBrowser(file)) {
+          setUploadStatus(`Extracting ${file.name} in your browser (${(file.size / 1048576).toFixed(1)} MB)…`)
+          const text = await extractTextInBrowser(file)
+          setUploadStatus(`Indexing ${file.name}…`)
+          res = await processText(file.name, text)
+        } else if (file.size > SERVER_LIMIT) {
+          throw new Error('Files over ~4 MB of this type must be converted (e.g. save DOCX as PDF/TXT).')
+        } else {
+          setUploadStatus(`Processing ${file.name}…`)
+          res = await processDocument(file)
+        }
         setChunks((c) => [...c, ...res.chunks])
         setDocuments((d) => [...d, {
           filename: res.filename, doc_type_label: res.doc_type_label,
           num_chunks: res.num_chunks, company_name: res.company_name,
         }])
-        if (res.company_name && !form.name) setForm((f) => ({ ...f, name: res.company_name }))
+        if (res.company_name && !form.name) {
+          newName = res.company_name
+          setForm((f) => ({ ...f, name: f.name || res.company_name }))
+        }
+        if (res.gstins?.length && !form.gstin) setForm((f) => ({ ...f, gstin: f.gstin || res.gstins[0] }))
+        setIds((prev) => {
+          const pans = [...new Set([...prev.pans, ...(res.pans || [])])]
+          const gstins = [...new Set([...prev.gstins, ...(res.gstins || [])])]
+          if (!newPan && res.pans?.length) newPan = res.pans[0]
+          if (!newGstin && res.gstins?.length) newGstin = res.gstins[0]
+          return { pans, gstins }
+        })
       } catch (e) {
         setError(`${file.name}: ${e.message}`)
       }
     }
     setUploading(false)
+    setUploadStatus('')
+    // Auto-verify externally as soon as a PAN/GSTIN is detected
+    if ((newPan || newGstin) && !verification) {
+      runVerification(newName || form.name, newPan, newGstin)
+    }
   }
 
   const removeDoc = (filename) => {
@@ -106,23 +171,39 @@ export default function NewAssessment() {
     setAssessing(false)
   }
 
+  const hasIds = ids.pans.length > 0 || ids.gstins.length > 0
+  const verdict = verification?.web_verification?.verdict
+  const V = VERDICT[verdict] || VERDICT.inconclusive
+
   return (
     <div>
       <PageHeader
         title="New Credit Assessment"
-        subtitle="Upload any financial documents — PDF, Excel, CSV, Word, text, JSON, or scanned images"
+        subtitle="Upload financial documents of any size — PDF, Excel, CSV, Word, text, JSON, or scanned images"
       />
+
+      {/* Guided step indicator */}
+      <div className="flex items-center gap-4 sm:gap-6 mb-8 fade-in">
+        <Step n={1} label="Upload documents" done={documents.length > 0} active />
+        <div className="h-px flex-1 bg-black/10" />
+        <Step n={2} label="Identity verification" done={!!verification} active={documents.length > 0} />
+        <div className="h-px flex-1 bg-black/10" />
+        <Step n={3} label="Company details" done={!!form.name && chunks.length > 0} active={documents.length > 0} />
+        <div className="h-px flex-1 bg-black/10" />
+        <Step n={4} label="AI assessment" active={!!form.name && chunks.length > 0} />
+      </div>
+
       <ErrorBanner message={error} />
 
       <div className="grid lg:grid-cols-2 gap-6">
-        {/* Upload panel */}
+        {/* Upload + verification panel */}
         <div className="space-y-4 fade-in">
           <div
             onDragOver={(e) => { e.preventDefault(); setDragging(true) }}
             onDragLeave={() => setDragging(false)}
             onDrop={(e) => { e.preventDefault(); setDragging(false); handleFiles(e.dataTransfer.files) }}
             onClick={() => fileRef.current?.click()}
-            className={`card cursor-pointer text-center py-14 border-2 border-dashed transition-all ${
+            className={`card cursor-pointer text-center py-12 border-2 border-dashed transition-all ${
               dragging ? 'border-accent bg-accent-soft' : 'border-black/10 hover:border-accent/50'
             }`}
           >
@@ -131,9 +212,9 @@ export default function NewAssessment() {
             <div className="w-14 h-14 mx-auto rounded-2xl bg-accent-soft flex items-center justify-center mb-4">
               {uploading ? <Loader2 className="animate-spin text-accent" size={24} /> : <UploadCloud className="text-accent" size={24} />}
             </div>
-            <div className="font-semibold">{uploading ? 'Processing & classifying…' : 'Drop files here or click to browse'}</div>
+            <div className="font-semibold">{uploading ? (uploadStatus || 'Processing…') : 'Drop files here or click to browse'}</div>
             <div className="text-xs text-ink-faint mt-2">
-              PDF · XLSX · CSV · DOCX · TXT · MD · JSON · PNG/JPG (OCR) — max 4 MB each
+              PDF · XLSX · CSV · DOCX · TXT · MD · JSON · PNG/JPG (OCR) — no size limit; large files are extracted in your browser
             </div>
           </div>
 
@@ -157,10 +238,75 @@ export default function NewAssessment() {
               })}
             </div>
           )}
+
+          {/* Identity verification card */}
+          {(hasIds || verifying || verification) && (
+            <div className="card">
+              <div className="flex items-center justify-between mb-3">
+                <h3 className="font-semibold flex items-center gap-2"><Fingerprint size={17} /> Identity Verification</h3>
+                <button
+                  onClick={() => runVerification(form.name, ids.pans[0], ids.gstins[0])}
+                  disabled={verifying}
+                  className="btn-secondary !px-4 !py-1.5 text-xs"
+                >
+                  {verifying ? <Loader2 size={13} className="animate-spin" /> : <ShieldCheck size={13} />}
+                  {verification ? 'Re-verify' : 'Verify externally'}
+                </button>
+              </div>
+
+              <div className="flex flex-wrap gap-2 mb-3">
+                {ids.pans.map((p) => (
+                  <span key={p} className="text-xs font-mono bg-accent-soft text-accent rounded-full px-3 py-1">PAN {p}</span>
+                ))}
+                {ids.gstins.map((g) => (
+                  <span key={g} className="text-xs font-mono bg-black/[0.05] rounded-full px-3 py-1">GSTIN {g}</span>
+                ))}
+                {!hasIds && <span className="text-xs text-ink-faint">No PAN/GSTIN detected in documents yet.</span>}
+              </div>
+
+              {verifying && (
+                <div className="flex items-center gap-2 text-sm text-ink-soft py-2">
+                  <Loader2 size={14} className="animate-spin" /> Checking MCA records, defaulter lists and public sources…
+                </div>
+              )}
+
+              {verification && !verifying && (
+                <div className="space-y-3">
+                  {verification.structural_checks?.map((c, i) => (
+                    <div key={i} className="flex items-start gap-2 text-sm">
+                      {c.result === 'valid'
+                        ? <CheckCircle2 size={15} className="text-emerald-500 mt-0.5 shrink-0" />
+                        : <ShieldAlert size={15} className="text-red-500 mt-0.5 shrink-0" />}
+                      <span><b>{c.check}</b> ({c.value}): {c.detail}</span>
+                    </div>
+                  ))}
+                  {verification.web_verification && (
+                    <div className={`rounded-xl border p-4 ${V.cls}`}>
+                      <div className="flex items-center gap-2 font-semibold text-sm mb-1.5">
+                        <V.Icon size={16} /> {V.label}
+                      </div>
+                      <p className="text-sm opacity-90">{verification.web_verification.summary}</p>
+                      {(verification.web_verification.findings || []).length > 0 && (
+                        <div className="mt-3 space-y-2">
+                          {verification.web_verification.findings.map((f, i) => (
+                            <div key={i} className="flex items-start gap-2 text-sm">
+                              <SeverityBadge severity={f.severity} />
+                              <span><b>{f.title}</b> — {f.detail}</span>
+                            </div>
+                          ))}
+                        </div>
+                      )}
+                    </div>
+                  )}
+                  <p className="text-[11px] text-ink-faint">{verification.disclaimer}</p>
+                </div>
+              )}
+            </div>
+          )}
         </div>
 
         {/* Company form */}
-        <div className="card fade-in">
+        <div className="card fade-in h-fit">
           <div className="flex items-center justify-between mb-5">
             <h3 className="font-semibold">Company Details</h3>
             <button onClick={autoFill} disabled={chunks.length === 0 || extracting} className="btn-secondary !px-4 !py-1.5 text-xs">

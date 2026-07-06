@@ -348,6 +348,18 @@ class CamRequest(BaseModel):
     chunks: List[Chunk] = []
 
 
+class ProcessTextRequest(BaseModel):
+    filename: str
+    text: str
+    doc_type: str = "auto"
+
+
+class VerifyRequest(BaseModel):
+    company_name: str = ""
+    pan: str = ""
+    gstin: str = ""
+
+
 DOC_TYPES = ["annual", "alm", "shareholding", "borrowing", "portfolio", "gst", "bank", "general"]
 DOC_TYPE_LABELS = {
     "annual": "Annual Report", "alm": "ALM / Liquidity Statement",
@@ -370,17 +382,34 @@ def health():
     return {"status": "ok", "version": "2.0.0"}
 
 
-@app.post("/api/documents/process")
-async def process_document(file: UploadFile = File(...), doc_type: str = Form("auto")):
-    data = await file.read()
-    if len(data) > 4 * 1024 * 1024:
-        raise HTTPException(413, "File too large — max 4 MB per file on this deployment.")
-    filename = file.filename or "document"
-    text = extract_text(filename, data)
+# PAN: 5 letters (4th = holder type), 4 digits, 1 letter. GSTIN embeds a PAN.
+_PAN_RE = re.compile(r"\b([A-Z]{3}[ABCFGHLJPT][A-Z][0-9]{4}[A-Z])\b")
+_GSTIN_RE = re.compile(r"\b([0-9]{2}[A-Z]{5}[0-9]{4}[A-Z][0-9A-Z][Z][0-9A-Z])\b")
+
+PAN_HOLDER_TYPE = {
+    "C": "Company", "P": "Individual", "H": "HUF", "F": "Firm / LLP",
+    "A": "Association of Persons", "T": "Trust", "B": "Body of Individuals",
+    "L": "Local Authority", "J": "Artificial Juridical Person", "G": "Government",
+}
+
+
+def detect_identifiers(text: str) -> Dict:
+    pans = list(dict.fromkeys(_PAN_RE.findall(text)))
+    gstins = list(dict.fromkeys(_GSTIN_RE.findall(text)))
+    # A GSTIN contains the PAN at positions 3..12 — surface it too
+    for g in gstins:
+        embedded = g[2:12]
+        if embedded not in pans:
+            pans.append(embedded)
+    return {"pans": pans[:5], "gstins": gstins[:5]}
+
+
+def _process_text(filename: str, text: str, doc_type: str) -> Dict:
     if not text.strip():
         raise HTTPException(422, f"No text could be extracted from {filename}.")
 
     chunks = chunk_text(text)
+    ids = detect_identifiers(text)
 
     # One small LLM call: classify doc type + detect company name together
     detected_type, company = "general", ""
@@ -413,7 +442,99 @@ async def process_document(file: UploadFile = File(...), doc_type: str = Form("a
         "doc_type": final_type,
         "doc_type_label": DOC_TYPE_LABELS.get(final_type, "General Document"),
         "company_name": company,
+        "pans": ids["pans"],
+        "gstins": ids["gstins"],
         "chunks": chunks,
+    }
+
+
+@app.post("/api/documents/process")
+async def process_document(file: UploadFile = File(...), doc_type: str = Form("auto")):
+    data = await file.read()
+    if len(data) > 4 * 1024 * 1024:
+        raise HTTPException(
+            413,
+            "File exceeds the 4 MB serverless request limit — the app will extract "
+            "the text in your browser instead; retry from the upload page.",
+        )
+    filename = file.filename or "document"
+    text = extract_text(filename, data)
+    return _process_text(filename, text, doc_type)
+
+
+@app.post("/api/documents/process-text")
+def process_document_text(req: ProcessTextRequest):
+    """Ingest text extracted client-side — removes any practical file-size cap."""
+    return _process_text(req.filename or "document", req.text, req.doc_type)
+
+
+@app.post("/api/verify")
+def verify_identity(req: VerifyRequest):
+    """
+    Verify PAN/GSTIN structure and cross-check the entity against public web
+    sources (MCA, GST portal mentions, news, defaulter lists) via web search.
+    Note: authoritative PAN verification needs the NSDL/Protean API; this
+    performs structural validation + open-source intelligence.
+    """
+    checks = []
+    pan = (req.pan or "").strip().upper()
+    gstin = (req.gstin or "").strip().upper()
+    if pan:
+        valid = bool(re.fullmatch(r"[A-Z]{5}[0-9]{4}[A-Z]", pan))
+        holder = PAN_HOLDER_TYPE.get(pan[3], "Unknown") if valid else None
+        checks.append({
+            "check": "PAN structure", "value": pan,
+            "result": "valid" if valid else "invalid",
+            "detail": f"Format OK — 4th character indicates holder type: {holder}." if valid
+                      else "Does not match the PAN format AAAAA9999A.",
+        })
+    if gstin:
+        valid = bool(_GSTIN_RE.fullmatch(gstin))
+        checks.append({
+            "check": "GSTIN structure", "value": gstin,
+            "result": "valid" if valid else "invalid",
+            "detail": (f"Format OK — state code {gstin[:2]}, embedded PAN {gstin[2:12]}."
+                       + (" Embedded PAN matches the detected PAN." if pan and gstin[2:12] == pan
+                          else (" Embedded PAN DIFFERS from the detected PAN — investigate." if pan else "")))
+                      if valid else "Does not match the 15-character GSTIN format.",
+        })
+
+    web = None
+    if req.company_name:
+        query = (
+            f"Verify the Indian entity '{req.company_name}'"
+            + (f" with PAN {pan}" if pan else "")
+            + (f" and GSTIN {gstin}" if gstin else "")
+            + ". Search MCA/ROC records, GST portal mentions, credit-rating actions, "
+            "RBI/SEBI enforcement, wilful-defaulter lists, and recent news. Report whether "
+            "the entity appears genuine and any red flags for a lender."
+        )
+        client = groq_client()
+        try:
+            resp = client.chat.completions.create(
+                model=GROQ_RESEARCH_MODEL,
+                messages=[{"role": "user", "content": query}],
+                temperature=0.1,
+                max_tokens=1400,
+            )
+            raw = resp.choices[0].message.content.strip()
+            web = llm_json(
+                'Convert this verification research into JSON {"verdict": "clear"|"caution"|"red_flag"|"inconclusive", '
+                '"findings": [{"severity": "High"|"Medium"|"Low", "title": str, "detail": str}], "summary": str}\n\n'
+                + raw[:8000],
+                max_tokens=900, temperature=0.1,
+            )
+            web["raw_report"] = raw
+        except HTTPException:
+            raise
+        except Exception as exc:
+            web = {"verdict": "inconclusive", "findings": [], "summary": f"Web verification unavailable: {exc}"}
+
+    return {
+        "structural_checks": checks,
+        "web_verification": web,
+        "disclaimer": "Structural + open-source verification. Authoritative PAN/GSTIN "
+                      "confirmation requires the Protean (NSDL) / GSTN APIs.",
     }
 
 
@@ -623,24 +744,79 @@ def research(req: ResearchRequest):
     return structured
 
 
+# CAM template modeled on the standard Indian NBFC Credit Appraisal Memorandum
+# format (applicant/KYC/facility sections followed by sections 20-34 of the
+# uploaded bank template: verification, reference checks, compliances,
+# financial comments, ratio analysis, visit report, risks & mitigants,
+# recommendation, and committee decision).
+CAM_TEMPLATE = [
+    {"title": "1. Applicant Details", "type": "fields",
+     "fields": ["Name of the Applicant", "Constitution", "Sector / Industry", "PAN", "GSTIN",
+                "Registered Office", "Date of Incorporation / Vintage", "Key Promoters / Directors"]},
+    {"title": "2. Facility Requested", "type": "fields",
+     "fields": ["Facility Type", "Amount Requested (₹ Cr)", "Purpose / End Use", "Proposed Tenor",
+                "Proposed Rate of Interest", "Security Offered"]},
+    {"title": "3. Banking & Repayment Track Record", "type": "prose"},
+    {"title": "4. Verification Detail", "type": "fields",
+     "fields": ["Residence Verification", "Reference Check — Debtors", "Reference Check — Creditors",
+                "Independent / Market Reference Check", "Assets Verification", "Price Verification",
+                "Machine Supplier Check", "Bankers Reference Check", "Dedupe / FCU Check",
+                "Customer Meeting", "Auditor Verification", "RM CAM Rating"]},
+    {"title": "5. Compliances & Legal", "type": "fields",
+     "fields": ["Income Tax Filing (Regular & Timely)", "GST / Service Tax Filing (Regular & Timely)",
+                "ESIC and EPF Dues", "Litigation Against the Entity", "Litigation Against the Promoters",
+                "Any Previous Defaults"]},
+    {"title": "6. Collateral Detail", "type": "prose"},
+    {"title": "7. Comments on Financials", "type": "fields",
+     "fields": ["Total Tangible Net Worth", "Total Outside Liabilities", "Current Assets",
+                "Current Liabilities", "Fixed Assets", "Turnover (Domestic / Export)",
+                "Interest to FI", "Depreciation", "Major Expense Observations"]},
+    {"title": "8. Ratio Analysis", "type": "fields",
+     "fields": ["Debt Income Ratio", "Working Capital", "Gross Profit Ratio", "Net Profit Ratio",
+                "TOL/TNW", "Debt / Equity", "DSCR", "Impact of Ratios After Proposed Loan"]},
+    {"title": "9. Observation on Proposal by Credit Analyst", "type": "fields",
+     "fields": ["Growth History", "Profitability", "Banking Observation", "CIBIL Observation",
+                "External Rating", "Industry Outlook", "Financial Observation"]},
+    {"title": "10. Risks Involved & Mitigants", "type": "risks"},
+    {"title": "11. Deviation Matrix", "type": "prose"},
+    {"title": "12. Credit Analyst Recommendation", "type": "prose"},
+    {"title": "13. Sanction Conditions", "type": "list"},
+    {"title": "14. Final Credit Committee Decision", "type": "fields",
+     "fields": ["Decision", "Approved Amount (₹ Cr)", "ROI", "Tenure", "Personal / Corporate Guarantees",
+                "Hypothecation Detail", "Insurance", "Any Other Condition"]},
+]
+
+
 @app.post("/api/cam/generate")
 def cam_generate(req: CamRequest):
     chunks = _chunks_dicts(req.chunks)
     context = build_context(chunks, [
-        f"{req.company_name} overview business operations",
-        "financial ratios revenue profit debt", "collateral security management",
-    ], per_query_k=3, max_chars=8000) if chunks else ""
-    assessment_json = json.dumps(req.assessment)[:6000]
+        f"{req.company_name} overview business promoters incorporation PAN GSTIN address",
+        "net worth capital reserves liabilities current assets fixed assets",
+        "turnover profit depreciation interest expenses ratios DSCR",
+        "collateral security bank limits repayment track record litigation compliance",
+    ], per_query_k=4, max_chars=11000) if chunks else ""
+    assessment_json = json.dumps(req.assessment)[:5000]
+    template_json = json.dumps(CAM_TEMPLATE)
     return llm_json(
-        "Draft a bank-grade Credit Appraisal Memo (CAM). Return JSON:\n"
-        '{"sections": [{"title": str, "content": "<detailed markdown-free prose, 150-300 words>"}]}\n'
-        "Sections, in order: Company Overview; Financial Analysis; 5Cs of Credit "
-        "(Character, Capacity, Capital, Collateral, Conditions); Risk Assessment; "
-        "Credit Decision & Terms; Compliance & Due Diligence.\n\n"
+        "Fill this bank Credit Appraisal Memorandum (CAM) template from the document "
+        "evidence and AI assessment. Return JSON:\n"
+        '{"sections": [{"title": str, "type": "fields"|"prose"|"risks"|"list", '
+        '"fields": [{"label": str, "value": str}] (for type=fields), '
+        '"content": str (for type=prose, 100-250 words), '
+        '"risks": [{"risk": str, "category": "Financial"|"Non-Financial", "mitigant": str}] (for type=risks), '
+        '"items": [str] (for type=list)}]}\n\n'
+        "RULES:\n"
+        "- Keep every section and every field from the template, in order.\n"
+        "- Fill values ONLY from the evidence/assessment. Where data is absent write "
+        "'To be verified' — never invent figures, names, or verification results.\n"
+        "- Verification-type fields default to 'Pending — to be conducted' unless evidenced.\n"
+        "- Use ₹ Crore units, cite exact figures from evidence.\n\n"
+        f"TEMPLATE:\n{template_json}\n\n"
         f"Company: {req.company_name} | Sector: {req.sector}\n"
-        f"Assessment result: {assessment_json}\n"
+        f"AI assessment: {assessment_json}\n"
         + (f"Document evidence:\n{context}" if context else ""),
-        max_tokens=2800, temperature=0.2,
+        max_tokens=6000, temperature=0.15,
     )
 
 
@@ -654,24 +830,54 @@ def cam_docx(req: CamRequest):
     import docx
     from docx.shared import Pt, RGBColor
     doc = docx.Document()
-    title = doc.add_heading("Credit Appraisal Memo", level=0)
+    style = doc.styles["Normal"]
+    style.font.name = "Times New Roman"
+    style.font.size = Pt(11)
+    title = doc.add_heading("CREDIT APPRAISAL MEMORANDUM", level=0)
     for run in title.runs:
         run.font.color.rgb = RGBColor(0x0B, 0x1F, 0x3A)
     meta = doc.add_paragraph()
-    meta.add_run(f"Company: {req.company_name}    Sector: {req.sector or '—'}").bold = True
+    meta.add_run(f"Name of the Applicant: {req.company_name}    Sector: {req.sector or '—'}").bold = True
     a = req.assessment
     if a.get("risk_score") is not None:
         doc.add_paragraph(
-            f"Risk Score: {a.get('risk_score')}/100 ({a.get('risk_band', '')})   "
+            f"AI Risk Score: {a.get('risk_score')}/100 ({a.get('risk_band', '')})   "
             f"Decision: {str(a.get('decision', '')).title()}   "
             f"Recommended: ₹{a.get('recommended_loan_cr', '—')} Cr @ {a.get('interest_rate_pct', '—')}% "
             f"for {a.get('tenor_months', '—')} months"
         )
+
+    def add_table(rows):
+        t = doc.add_table(rows=0, cols=2)
+        t.style = "Table Grid"
+        for label, value in rows:
+            cells = t.add_row().cells
+            cells[0].text = str(label)
+            cells[0].paragraphs[0].runs[0].bold = True
+            cells[1].text = str(value)
+
     for s in sections:
         doc.add_heading(s.get("title", "Section"), level=1)
-        p = doc.add_paragraph(s.get("content", ""))
-        for run in p.runs:
-            run.font.size = Pt(10.5)
+        stype = s.get("type", "prose")
+        if stype == "fields":
+            add_table([(f.get("label", ""), f.get("value", "To be verified")) for f in s.get("fields", [])])
+        elif stype == "risks":
+            t = doc.add_table(rows=1, cols=3)
+            t.style = "Table Grid"
+            hdr = t.rows[0].cells
+            for i, h in enumerate(["Risk", "Category", "Mitigant"]):
+                hdr[i].text = h
+                hdr[i].paragraphs[0].runs[0].bold = True
+            for r in s.get("risks", []):
+                cells = t.add_row().cells
+                cells[0].text = str(r.get("risk", ""))
+                cells[1].text = str(r.get("category", ""))
+                cells[2].text = str(r.get("mitigant", ""))
+        elif stype == "list":
+            for item in s.get("items", []):
+                doc.add_paragraph(str(item), style="List Number")
+        else:
+            doc.add_paragraph(s.get("content", ""))
     buf = io.BytesIO()
     doc.save(buf)
     return Response(

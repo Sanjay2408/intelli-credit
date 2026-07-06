@@ -19,12 +19,16 @@ export function StoreProvider({ children }) {
   const [company, setCompany] = useState(() => load('ic_company', { name: '', sector: '', loanCr: '' }))
   const [assessment, setAssessment] = useState(() => load('ic_assessment', null))
   const [history, setHistory] = useState(() => load('ic_history', []))
+  const [ids, setIds] = useState(() => load('ic_ids', { pans: [], gstins: [] }))
+  const [verification, setVerification] = useState(() => load('ic_verification', null))
 
   useEffect(() => { try { localStorage.setItem('ic_chunks', JSON.stringify(chunks)) } catch { /* quota */ } }, [chunks])
   useEffect(() => { localStorage.setItem('ic_documents', JSON.stringify(documents)) }, [documents])
   useEffect(() => { localStorage.setItem('ic_company', JSON.stringify(company)) }, [company])
   useEffect(() => { localStorage.setItem('ic_assessment', JSON.stringify(assessment)) }, [assessment])
   useEffect(() => { localStorage.setItem('ic_history', JSON.stringify(history)) }, [history])
+  useEffect(() => { localStorage.setItem('ic_ids', JSON.stringify(ids)) }, [ids])
+  useEffect(() => { localStorage.setItem('ic_verification', JSON.stringify(verification)) }, [verification])
 
   const addAssessmentToHistory = (a, companyName) => {
     setHistory((h) => [
@@ -38,12 +42,15 @@ export function StoreProvider({ children }) {
     setDocuments([])
     setAssessment(null)
     setCompany({ name: '', sector: '', loanCr: '' })
+    setIds({ pans: [], gstins: [] })
+    setVerification(null)
   }
 
   return (
     <StoreContext.Provider value={{
       chunks, setChunks, documents, setDocuments, company, setCompany,
       assessment, setAssessment, history, addAssessmentToHistory, resetSession,
+      ids, setIds, verification, setVerification,
     }}>
       {children}
     </StoreContext.Provider>

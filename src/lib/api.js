@@ -25,6 +25,10 @@ export async function processDocument(file, docType = 'auto') {
   return res.json()
 }
 
+export const processText = (filename, text, docType = 'auto') =>
+  post('/documents/process-text', { filename, text, doc_type: docType })
+export const verifyIdentity = (companyName, pan, gstin) =>
+  post('/verify', { company_name: companyName, pan, gstin })
 export const queryDocuments = (question, chunks) => post('/query', { question, chunks })
 export const extractForm = (chunks) => post('/assess/extract-form', { chunks })
 export const runAssessment = (payload) => post('/assess', payload)
