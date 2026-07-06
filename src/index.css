@@ -1,0 +1,48 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+html {
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+body {
+  @apply bg-surface text-ink font-sans;
+}
+
+::selection {
+  background: rgba(0, 113, 227, 0.18);
+}
+
+@layer components {
+  .card {
+    @apply bg-surface-card rounded-2xl shadow-card border border-black/[0.04] p-6;
+  }
+  .btn-primary {
+    @apply inline-flex items-center justify-center gap-2 rounded-full bg-accent text-white
+      px-6 py-2.5 text-sm font-medium transition-all hover:bg-accent-hover
+      active:scale-[0.98] disabled:opacity-40 disabled:pointer-events-none;
+  }
+  .btn-secondary {
+    @apply inline-flex items-center justify-center gap-2 rounded-full bg-ink/[0.05] text-ink
+      px-6 py-2.5 text-sm font-medium transition-all hover:bg-ink/[0.09]
+      active:scale-[0.98] disabled:opacity-40 disabled:pointer-events-none;
+  }
+  .input {
+    @apply w-full rounded-xl border border-black/10 bg-white px-4 py-2.5 text-sm
+      placeholder:text-ink-faint focus:outline-none focus:ring-2 focus:ring-accent/40
+      focus:border-accent transition-shadow;
+  }
+  .label {
+    @apply block text-xs font-semibold uppercase tracking-wide text-ink-soft mb-1.5;
+  }
+}
+
+.fade-in {
+  animation: fadeIn 0.45s cubic-bezier(0.22, 1, 0.36, 1);
+}
+@keyframes fadeIn {
+  from { opacity: 0; transform: translateY(10px); }
+  to { opacity: 1; transform: translateY(0); }
+}

@@ -1,0 +1,13 @@
+node_modules/
+dist/
+.vercel/
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Secrets — never commit API keys
+.env
+.env.local
+.env.*.local
+api/.env
