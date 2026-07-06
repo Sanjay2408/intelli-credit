@@ -11,3 +11,6 @@ venv/
 .env.local
 .env.*.local
 api/.env
+
+.vercel
+.env*
